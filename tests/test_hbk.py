@@ -1,0 +1,58 @@
+from __future__ import annotations
+
+from typing import BinaryIO
+
+import pytest
+
+from dissect.archive.hbk import (
+    HBK,
+)
+
+
+def test_hbk_volumes(hbk_unencrypted: BinaryIO) -> None:
+    hbk = HBK(hbk_unencrypted)
+
+    assert len(hbk.volumes()) == 2
+    assert hbk.volumes()[0].name == "@AppConfig"
+    assert hbk.volumes()[1].name == "ssd"
+    assert hbk.volumes()[0] == hbk.volume("@AppConfig")
+
+
+def test_hbk_file_reading_1(hbk_unencrypted: BinaryIO) -> None:
+    hbk = HBK(hbk_unencrypted)
+
+    assert hbk.get("/ssd/dissect_test/some_subfolder/").is_dir()
+    file = hbk.get("/ssd/dissect_test/some_subfolder/large_repetitive_data.txt")
+    assert not file.is_dir()
+
+    assert file.size == 5_345_280  # ~5.1 MB
+    fh = file.open()
+    assert fh.read(10) == b"DISSECTFTW"
+    assert fh.read(2) == b"DI"
+    assert fh.read(5) == b"SSECT"
+    assert fh.read(8) == b"FTWDISSE"
+    fh.seek(1337)
+    assert fh.read(11) == b"FTWDISSECTF"
+
+    # Read it and verify content
+    fh.seek(0)
+    data = fh.read()
+    assert data == b"DISSECTFTW" * 534_528
+
+
+def test_hbk_unencrypted_versioning(hbk_unencrypted: BinaryIO) -> None:
+    hbk = HBK(hbk_unencrypted)
+    assert len(hbk.versions) == 3
+    # Automatically use highest version
+    assert hbk.current_version.id == 3
+    with pytest.raises(expected_exception=ValueError, match="Version 0 not found"):
+        hbk.use_version(0)  # Error on non-existent version
+
+    # File contents differ between versions
+    hbk.use_version(1)
+    assert hbk.get("/ssd/dissect_test/Password.txt").open().read() == b"My password is: Summer123!@#"
+    hbk.use_version(2)
+    assert (
+        hbk.get("/ssd/dissect_test/Password.txt").open().read()
+        == b"My password is:\r\n\r\nWhoops, I shouldn't have put it there in plaintext."
+    )

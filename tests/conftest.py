@@ -57,3 +57,13 @@ def vbk9() -> Iterator[BinaryIO]:
 @pytest.fixture
 def vbk13() -> Iterator[BinaryIO]:
     yield from open_file_gz("_data/test13.vbk.gz")
+
+
+@pytest.fixture
+def hbk_crypted() -> Iterator[BinaryIO]:
+    yield from open_file_gz("_data/hbk_crypted_henk123!.hbk.gz")
+
+
+@pytest.fixture
+def hbk_unencrypted() -> Iterator[BinaryIO]:
+    yield from open_file_gz("_data/dissect_backup_test_task.hbk.gz")
