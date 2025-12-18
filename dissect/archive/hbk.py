@@ -15,6 +15,16 @@ from dissect.archive.exceptions import FileNotFoundError
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+try:
+    from Crypto.Cipher import AES, ChaCha20_Poly1305
+    from Crypto.Protocol.KDF import PBKDF2
+    from Crypto.Util.Padding import unpad
+
+    HAS_CRYPTO = True
+
+except ImportError:
+    HAS_CRYPTO = False
+
 log = logging.getLogger(__name__)
 
 
@@ -193,12 +203,15 @@ class Volume(VolumeEntry):
 
 
 class HBK:
-    def __init__(self, fh: BinaryIO, version: int = -1):
+    def __init__(self, fh: BinaryIO, version: int = -1, key: bytes | None = None):
         self.fh = fh
-
         # Fetch the main directory name, which will be the first entry in the zip file
         self.zip = zipfile.ZipFile(fh, mode="r")
         self.base = self.zip.filelist.pop(0).filename.rstrip("/")
+        self.key = key
+        if self.key:
+            log.critical(f"Using provided HBK decryption key: {self.key}")
+        log.critical("HBK base directory: %s", self.base)
 
         self.versions = {
             row.get("id"): Version(row, self)
@@ -206,6 +219,12 @@ class HBK:
         }
         self.current_version = self.versions[max(self.versions.keys())]
         log.info("Version in use: %s", self.current_version)
+
+    def decrypt_b64(self, b64str: str) -> bytes:
+        if not self.key:
+            raise ValueError("No decryption key available for HBK decryption")
+        # TODO check what kind of encryption is used
+        raise NotImplementedError("HBK decryption not yet implemented")
 
     def use_version(self, version_id: int) -> None:
         if version_id not in self.versions:

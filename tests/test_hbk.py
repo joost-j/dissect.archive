@@ -18,6 +18,22 @@ def test_hbk_volumes(hbk_unencrypted: BinaryIO) -> None:
     assert hbk.volumes()[0] == hbk.volume("@AppConfig")
 
 
+def test_hbk_crypted_volumes(hbk_crypted: BinaryIO) -> None:
+    hbk = HBK(hbk_crypted)
+
+    assert len(hbk.volumes()) == 2
+    assert hbk.volumes()[0].name == "@AppConfig"
+    assert hbk.volumes()[1].name == "ssd"
+    assert hbk.volumes()[0] == hbk.volume("@AppConfig")
+
+
+def test_hbk_crypted_file_reading_1(hbk_unencrypted: BinaryIO) -> None:
+    hbk = HBK(hbk_unencrypted)
+    assert list(hbk.current_version.iterdir()) == 2
+    assert list(hbk.get("/ssd/").iterdir())
+
+
+    assert hbk.get("/ssd/dissect_test/some_subfolder/").is_dir()
 def test_hbk_file_reading_1(hbk_unencrypted: BinaryIO) -> None:
     hbk = HBK(hbk_unencrypted)
 
