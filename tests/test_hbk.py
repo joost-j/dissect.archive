@@ -4,9 +4,7 @@ from typing import BinaryIO
 
 import pytest
 
-from dissect.archive.hbk import (
-    HBK,
-)
+from dissect.archive.hbk import HBK, InvalidKeyError, MissingKeyError
 
 
 def test_hbk_volumes(hbk_unencrypted: BinaryIO) -> None:
@@ -18,8 +16,8 @@ def test_hbk_volumes(hbk_unencrypted: BinaryIO) -> None:
     assert hbk.volumes()[0] == hbk.volume("@AppConfig")
 
 
-def test_hbk_crypted_volumes(hbk_crypted: BinaryIO) -> None:
-    hbk = HBK(hbk_crypted)
+def test_hbk_crypted_volumes(hbk_encrypted: BinaryIO) -> None:
+    hbk = HBK(hbk_encrypted, password="dissectftw")
 
     assert len(hbk.volumes()) == 2
     assert hbk.volumes()[0].name == "@AppConfig"
@@ -27,13 +25,19 @@ def test_hbk_crypted_volumes(hbk_crypted: BinaryIO) -> None:
     assert hbk.volumes()[0] == hbk.volume("@AppConfig")
 
 
-def test_hbk_crypted_file_reading_1(hbk_unencrypted: BinaryIO) -> None:
-    hbk = HBK(hbk_unencrypted)
-    assert list(hbk.current_version.iterdir()) == 2
-    assert list(hbk.get("/ssd/").iterdir())
+def test_hbk_crypted_file_wrong_password(hbk_encrypted: BinaryIO) -> None:
+    with pytest.raises(expected_exception=InvalidKeyError, match="Wrong password or private key provided"):
+        HBK(hbk_encrypted, password="wrongpassword")
 
 
-    assert hbk.get("/ssd/dissect_test/some_subfolder/").is_dir()
+def test_hbk_crypted_no_keys_provided(hbk_encrypted: BinaryIO) -> None:
+    with pytest.raises(
+        expected_exception=MissingKeyError,
+        match=r"This HBK file is encrypted, but no password or private key was provided.",
+    ):
+        HBK(hbk_encrypted)
+
+
 def test_hbk_file_reading_1(hbk_unencrypted: BinaryIO) -> None:
     hbk = HBK(hbk_unencrypted)
 
