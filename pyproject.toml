@@ -25,7 +25,7 @@ classifiers = [
   "Topic :: Utilities",
 ]
 dependencies = [
-    "cryptography",
+    "pynacl",
     "argon2-cffi",
     "dissect.cstruct>=4,<5",
     "dissect.util>=3.22,<4",

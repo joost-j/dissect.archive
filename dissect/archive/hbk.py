@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import logging
 import zipfile
 from datetime import datetime, timezone
+from enum import Enum
+from functools import cached_property
 from typing import TYPE_CHECKING, BinaryIO
 
 import argon2
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
 from dissect.database import SQLite3
 from dissect.util.compression import lz4
 from dissect.util.stream import AlignedStream
+from nacl.public import PrivateKey, SealedBox
 
 from dissect.archive.c_hbk import c_hbk
 from dissect.archive.exceptions import FileNotFoundError
@@ -17,17 +23,13 @@ from dissect.archive.exceptions import FileNotFoundError
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-try:
-    from Crypto.Hash import SHA512
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-
-    HAS_CRYPTO = True
-
-except ImportError:
-    HAS_CRYPTO = False
 
 log = logging.getLogger(__name__)
+
+
+class Constants(Enum):
+    CHECKSUM = "8Llx6OSaDPzbwCkjG8eYc64GZGMIlMXm"
+    FILENAME = "kkE7sRZRvnbVlJFofhD7WCXumXBGyzki"
 
 
 class InvalidKeyError(Exception):
@@ -59,9 +61,6 @@ def find_rows(
 
 
 def crypto_pwhash(key: str, salt: str) -> bytes:
-    """
-    Recreate libsodium's crypto_pwhash functionality using argon2 library.
-    """
     return argon2.low_level.hash_secret_raw(
         key.encode(),
         salt=hashlib.md5(salt.encode()).digest(),
@@ -74,20 +73,16 @@ def crypto_pwhash(key: str, salt: str) -> bytes:
 
 
 def crypto_box_seed_keypair(seed: bytes) -> tuple[bytes, bytes]:
-    """
-    Recreate libsodium's crypto_box_seed_keypair functionality using cryptography library.
-    """
-    sha512 = SHA512.new(seed).digest()
+    sha512 = hashlib.sha512(seed).digest()
+    private_key = PrivateKey(sha512[:32])
+    public_key = private_key.public_key
+    return bytes(public_key), sha512[:32]
 
-    # Use first 32 bytes as private key and generate the keypair
-    private_key = X25519PrivateKey.from_private_bytes(sha512[:32])
-    public_key = private_key.public_key()
 
-    public_key_bytes = public_key.public_bytes(
-        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
-    )
-
-    return public_key_bytes, sha512[:32]
+def crypto_box_seal_open(ciphertext: bytes, private_key: bytes) -> bytes:
+    priv_key = PrivateKey(private_key)
+    sealed_box = SealedBox(priv_key)
+    return sealed_box.decrypt(ciphertext)
 
 
 class FileStream(AlignedStream):
@@ -95,6 +90,8 @@ class FileStream(AlignedStream):
         self.volume = volume
         self.path = path
         self.off_virtual_file = off_virtual_file
+
+        log.debug("FileStream init: path=%s, size=%d, off_virtual_file=%d", path, size, off_virtual_file)
 
         # This is probably not how it should be used
         super().__init__(size, align=1)
@@ -105,6 +102,11 @@ class FileStream(AlignedStream):
         vfi_fh.seek(self.off_virtual_file)
         virtual_file_entry_data = c_hbk.virtual_file_entry(vfi_fh)
         vfi_fh.close()
+        log.debug(
+            "Virtual file entry: file_chunk_id=%d, chunk_list_offset=%d",
+            virtual_file_entry_data.file_chunk_id,
+            virtual_file_entry_data.chunk_list_offset,
+        )
 
         # Now we know where the list of chunks is. Read the virtual file chunk list
         fci_fh = self.volume.hbk.zip.open(
@@ -113,6 +115,7 @@ class FileStream(AlignedStream):
         fci_fh.seek(virtual_file_entry_data.chunk_list_offset - 4)
         virtual_file_chunk_list = c_hbk.virtual_file_chunk_list(fci_fh)
         fci_fh.close()
+        log.debug("Found %d chunks for file %s", len(virtual_file_chunk_list.chunks), self.path)
 
         # Now that we have the chunks, we need to know in which pool they are stored
         indexes = {chunk.index for chunk in virtual_file_chunk_list.chunks}
@@ -136,46 +139,75 @@ class FileStream(AlignedStream):
         for fh in chunk_filehandles.values():
             fh.close()
 
-    # def _decrypt(self, data: bytes) -> bytes:
-    #     vkey_table = SQLite3(self.zip.open(f"{self.volume.hbk.base}/Pool/vkey.db")).table("vkey")
-    #     row = find_rows(vkey_table, "version_id", self.volume.version.id, single=True)
-
-    #     if row:
-    #         rsa_vkey = row.get("rsa_vkey")
-    #         rsa_vkey_iv = row.get("rsa_vkey_iv")
-    #         checksum = row.get("checksum")
-    #         ref_count = row.get("ref_count")
+        log.debug(
+            "FileStream init complete: %d chunks mapped to %d unique pools",
+            len(self._chunks_pool_info),
+            len(self._unique_pools),
+        )
 
     def _read(self, offset: int, length: int) -> bytes:
+        log.debug("_read called: offset=%d, length=%d for file %s", offset, length, self.path)
         result = []
 
         pools = (x for x in self._chunks_pool_info)
+        chunk_idx = 0
 
         while length > 0:
             pool = next(pools)
+            log.debug(
+                "Processing chunk %d: pool=%s/%s/%s, chunk_offset=%d",
+                chunk_idx,
+                pool.p1,
+                pool.p2,
+                pool.pool,
+                pool.chunk_offset,
+            )
 
-            # Open fresh file handles for each read to avoid state issues
+            # Read the chunk pool data index to get offset and lengths
             index_fh = self.volume.hbk.zip.open(f"{self.volume.hbk.base}/Pool/{pool.p1}/{pool.p2}/{pool.pool}.index")
             index_fh.seek(pool.chunk_offset)
             data_info = c_hbk.chunk_pool_data(index_fh)
-            chunk_length = data_info.uncompressed_length
             index_fh.close()
+            log.debug(
+                "Chunk data: offset=%d, length=%d, uncompressed_length=%d",
+                data_info.offset,
+                data_info.length,
+                data_info.uncompressed_length,
+            )
 
-            # Here we need to read the chunk
+            # Here we need to read the actual chunk data from a bucket file
             data_fh = self.volume.hbk.zip.open(f"{self.volume.hbk.base}/Pool/{pool.p1}/{pool.p2}/{pool.pool}.bucket")
             data_fh.seek(data_info.offset)
             data = data_fh.read(data_info.length)
             data_fh.close()
 
-            uncompressed = lz4.decompress(data, uncompressed_size=chunk_length)
-            offset_in_block = offset % chunk_length
+            if self.volume.hbk.encrypted:
+                log.debug("File encrypted: %s", self.volume.hbk.encrypted)
+                # This shouldn't be a for loop, but can't yet find where the encryption version is stored
+                for version, aes_keys in self.volume.version_keys.items():
+                    log.debug("Trying to decrypt chunk with version keys of version %d", version)
+                    try:
+                        data = AES.new(aes_keys["vkey"], AES.MODE_CBC, aes_keys["vkey_iv"]).decrypt(data)
+                        data = unpad(data, AES.block_size)
+                        uncompressed = lz4.decompress(data, uncompressed_size=data_info.uncompressed_length)
+                        log.debug("Decryption and decompression successful with version %d keys", version)
+                        break
+                    except Exception as e:
+                        log.debug("Decryption with version %d keys failed: %s", version, e)
+                        continue
 
-            read_size = min(length, chunk_length - offset_in_block)
+            else:
+                uncompressed = lz4.decompress(data, uncompressed_size=data_info.uncompressed_length)
+            offset_in_block = offset % data_info.uncompressed_length
+
+            read_size = min(length, data_info.uncompressed_length - offset_in_block)
+            log.debug("Reading from chunk %d: offset_in_block=%d, read_size=%d", chunk_idx, offset_in_block, read_size)
             result.append(uncompressed[offset_in_block : offset_in_block + read_size])
 
             length -= read_size
             offset += read_size
-            if read_size < chunk_length:
+            chunk_idx += 1
+            if read_size < data_info.uncompressed_length:
                 break
 
         return b"".join(result)
@@ -186,6 +218,8 @@ class VolumeEntry:
         self._volume = volume
         self._row = row
         self.name = self._row.get("file_name") if row else ""
+        if self._volume and self._row and self._volume.hbk.encrypted:
+            self.name = self._volume.hbk._decrypt_filename(self.name)
         self.path = parent + "/" + self._row.get("file_name") if row and self._volume else parent
         self.size = self._row.get("size") if row else 0
 
@@ -246,12 +280,46 @@ class Volume(VolumeEntry):
         self.root_name_id_v2 = None
         self.path = self.version.path + self.name
 
+        if self.hbk.encrypted:
+            self.version_keys = self._prepare_version_keys()
+
         # Search for the identifier of the root directory
         for row in self.file_db.table("version_list").rows():
             pname_id_v2 = row.get("pname_id_v2")
             if pname_id_v2[:4] == pname_id_v2[4:8]:
                 self.root_name_id_v2 = pname_id_v2
                 break
+
+    def _prepare_version_keys(self) -> None:
+        # Even though we browse the HBK file in only one version,
+        # files are encrypted with version-specific keys so prepare them here.
+        vkeys = {}
+        vkey_table = SQLite3(self.hbk.zip.open(f"{self.hbk.base}/Pool/vkey.db")).table("vkey")
+        for row in vkey_table.rows():
+            version_id = int(row.get("version_id"))
+            rsa_vkey = row.get("rsa_vkey")
+            rsa_vkey_iv = row.get("rsa_vkey_iv")
+            checksum = row.get("checksum")
+
+            checksum_data = rsa_vkey + Constants.CHECKSUM.value.encode("utf-8") + rsa_vkey_iv
+            calculated_checksum = hashlib.md5(checksum_data).digest()
+
+            if calculated_checksum != checksum:
+                log.warning("Version key checksum mismatch for version %d, skipping", version_id)
+                continue
+
+            log.debug("Decrypting version key for version %d", version_id)
+            log.debug("Encrypted rsa_vkey: %s", rsa_vkey.hex())
+            log.debug("Length of rsa_vkey: %d", len(rsa_vkey))
+            log.debug("Our private key: %s", self.hbk.privkey.hex())
+            log.debug("Our public key: %s", self.hbk.pubkey.hex())
+            decrypted_vkey = crypto_box_seal_open(rsa_vkey, self.hbk.privkey)
+            log.debug("Decrypted rsa_vkey: %s", decrypted_vkey.hex())
+            decrypted_vkey_iv = crypto_box_seal_open(rsa_vkey_iv, self.hbk.privkey)
+            log.debug("Decrypted rsa_vkey_iv: %s", decrypted_vkey_iv.hex())
+            vkeys[version_id] = {"vkey": decrypted_vkey, "vkey_iv": decrypted_vkey_iv}
+
+        return vkeys
 
     def __repr__(self) -> str:
         return f"<Volume path={self.path} id={(self.root_name_id_v2.hex())}>"
@@ -283,7 +351,7 @@ class HBK:
                 # If password or private key is provided, prepare the session key
             if password or private_key:
                 try:
-                    self.sessionkey = self._prepare_keys(password, private_key)
+                    self.privkey, self.pubkey = self._prepare_keys(password, private_key)
                 except Exception as e:
                     raise InvalidKeyError(e)
         elif not self.encrypted and (password or private_key):
@@ -294,29 +362,16 @@ class HBK:
             for row in SQLite3(self.zip.open(f"{self.base}/Config/version_info.db")).table("version_info").rows()
         }
         self.current_version = self.versions[max(self.versions.keys())]
-        log.critical("Version in use: %s", self.current_version)
+        log.debug("Version in use: %s", self.current_version)
 
     def _prepare_keys(self, password: str | None, private_key: str | None) -> bytes:
         if password:
             log.debug("Deriving HBK keypair from provided password.")
-            salt_row = find_rows(self._synobkpinfo_db, "info_name", "dataUnique", single=True)
-
-            if not salt_row:
-                log.critical("Could not find dataUnique salt in synobkpinfo.db, aborting.")
-                exit(1)
-
-            salt_init = salt_row.get("info_value")
-
-            seed = crypto_pwhash(password, salt_init)
+            seed = crypto_pwhash(password, self.unikey)
             public_key, private_key = crypto_box_seed_keypair(seed)
         elif private_key:
             log.debug("Using provided private key to derive public key.")
-            # Private key should be providex as hex
-            public_key = (
-                X25519PrivateKey.from_private_bytes(private_key)
-                .public_key()
-                .public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
-            )
+            public_key = bytes(PrivateKey(private_key).public_key)
 
         included_pubkey = self.zip.open(f"{self.base}/Config/public.pem").read()
         if public_key != included_pubkey:
@@ -325,8 +380,26 @@ class HBK:
             raise InvalidKeyError("Wrong password or private key provided.")
 
         log.info("Successfully derived correct decryption key to decrypt file metadata.")
+        log.debug("Private key: %s", private_key.hex())
+        log.debug("Public key: %s", public_key.hex())
+        return private_key, public_key
 
         # encKeys = self.zip.open(f"{self.base}/Config/encKeys").read()
+
+    def _decrypt_filename(self, b64_name: str) -> str:
+        # Create a sha256 hash of the private key
+
+        private_key = self.privkey + self.unikey.encode("utf-8")
+        key = hashlib.sha256(private_key).digest()
+
+        combined = self.unikey + Constants.FILENAME.value
+        iv = hashlib.md5(combined.encode("utf-8")).digest()
+        log.debug("Base64 filename: %s", b64_name)
+        ciphertext = base64.urlsafe_b64decode(b64_name)
+        plaintext = AES.new(key, AES.MODE_CBC, iv).decrypt(ciphertext)
+        unpadded_plaintext = unpad(plaintext, AES.block_size)
+
+        return unpadded_plaintext.decode("utf-8")
 
     def use_version(self, version_id: int) -> None:
         if version_id not in self.versions:
@@ -336,10 +409,15 @@ class HBK:
     def volumes(self) -> list[Volume]:
         return list(self.current_version.volumes.values())
 
-    @property
+    @cached_property
     def encrypted(self) -> bool:
         matching_rows = find_rows(self._synobkpinfo_db, "info_name", "dataEnc", single=True)
         return matching_rows.get("info_value") == "T"
+
+    @cached_property
+    def unikey(self) -> str:
+        unikey_row = find_rows(self._synobkpinfo_db, "info_name", "dataUnique", single=True)
+        return unikey_row.get("info_value")
 
     def volume(self, name: str) -> Volume | None:
         return self.current_version.volume(name)
