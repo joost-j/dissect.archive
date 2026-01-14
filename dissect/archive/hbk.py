@@ -112,13 +112,25 @@ class FileStream(AlignedStream):
         fci_fh = self.volume.hbk.zip.open(
             f"{self.volume.hbk.base}/Config/file_chunk{virtual_file_entry_data.file_chunk_id}.index/0.idx"
         )
-        fci_fh.seek(virtual_file_entry_data.chunk_list_offset - 4)
+        fci_fh.seek(virtual_file_entry_data.chunk_list_offset - 20)
+        log.debug("Seeking to chunk list offset: %d", virtual_file_entry_data.chunk_list_offset - 20)
         virtual_file_chunk_list = c_hbk.virtual_file_chunk_list(fci_fh)
         fci_fh.close()
         log.debug("Found %d chunks for file %s", len(virtual_file_chunk_list.chunks), self.path)
 
         # Now that we have the chunks, we need to know in which pool they are stored
-        indexes = {chunk.index for chunk in virtual_file_chunk_list.chunks}
+        # Extract actual index and offset from the double-packed offset field
+        chunk_data = []
+        indexes = set()
+
+        for chunk in virtual_file_chunk_list.chunks:
+            # Calculate actual index and offset using range-based method
+            # This handles different offset ranges with different base offsets
+            actual_index, actual_offset = self._calculate_chunk_index_and_offset(chunk.subindex_and_offset)
+            chunk_data.append((actual_index, actual_offset))
+            indexes.add(actual_index)
+
+        log.debug("Opening chunk index files for indexes: %s", indexes)
 
         chunk_filehandles = {
             index: self.volume.hbk.zip.open(f"{self.volume.hbk.base}/Pool/chunk_index/{index}.idx") for index in indexes
@@ -127,10 +139,14 @@ class FileStream(AlignedStream):
         self._chunks_pool_info = []
         self._unique_pools = set()
 
-        for chunk in virtual_file_chunk_list.chunks:
+        for i, (actual_index, actual_offset) in enumerate(chunk_data):
             # This is not very efficient for now, but we can optimize later
-            chi_fh = chunk_filehandles[chunk.index]
-            chi_fh.seek(chunk.offset)
+            chi_fh = chunk_filehandles[actual_index]
+            log.debug("Seeking to chunk %d with offset %d for chunk index %d", i, actual_offset, actual_index)
+            log.debug("File path: %s", f"{self.volume.hbk.base}/Pool/chunk_index/{actual_index}.idx")
+            chi_fh.seek(actual_offset)
+            # dumpstruct(virtual_file_chunk_list.chunks[i])
+            log.debug("Reading chunk pool info for chunk index=%d, offset=%d", actual_index, actual_offset)
             # Read the pool chunk index entry
             chunk_pool_info = c_hbk.chunk_pool_info(chi_fh)
             self._chunks_pool_info.append(chunk_pool_info)
@@ -145,18 +161,56 @@ class FileStream(AlignedStream):
             len(self._unique_pools),
         )
 
+    def _calculate_chunk_index_and_offset(self, original_offset: int) -> tuple[int, int]:
+        """
+        Calculate the actual chunk index and offset from the encoded offset value.
+
+        The index is encoded in bits 23-24 of the offset, and the base offset
+        to subtract is just those bits shifted back to their position.
+
+        Args:
+            original_offset: The raw offset from the chunk list
+
+        Returns:
+            tuple: (actual_index, actual_offset)
+        """
+        index = (original_offset >> 23) & 0b11
+        base_offset = index << 23
+        return index, original_offset - base_offset
+
     def _read(self, offset: int, length: int) -> bytes:
         log.debug("_read called: offset=%d, length=%d for file %s", offset, length, self.path)
         result = []
 
-        pools = (x for x in self._chunks_pool_info)
+        # Calculate cumulative chunk sizes to find the correct starting chunk
+        cumulative_offset = 0
         chunk_idx = 0
 
-        while length > 0:
-            pool = next(pools)
+        # Find the first chunk that contains the requested offset
+        for i, pool in enumerate(self._chunks_pool_info):
+            index_fh = self.volume.hbk.zip.open(f"{self.volume.hbk.base}/Pool/{pool.p1}/{pool.p2}/{pool.pool}.index")
+            index_fh.seek(pool.chunk_offset)
+            data_info = c_hbk.chunk_pool_data(index_fh)
+            index_fh.close()
+
+            if cumulative_offset + data_info.uncompressed_length > offset:
+                # This chunk contains the start of our read
+                chunk_idx = i
+                break
+            cumulative_offset += data_info.uncompressed_length
+
+        # Start reading from the identified chunk
+        remaining_length = length
+        current_offset = offset
+
+        for i in range(chunk_idx, len(self._chunks_pool_info)):
+            if remaining_length <= 0:
+                break
+
+            pool = self._chunks_pool_info[i]
             log.debug(
                 "Processing chunk %d: pool=%s/%s/%s, chunk_offset=%d",
-                chunk_idx,
+                i,
                 pool.p1,
                 pool.p2,
                 pool.pool,
@@ -174,6 +228,12 @@ class FileStream(AlignedStream):
                 data_info.length,
                 data_info.uncompressed_length,
             )
+
+            # Skip this chunk if the requested offset is beyond this chunk
+            if offset >= cumulative_offset + data_info.uncompressed_length:
+                cumulative_offset += data_info.uncompressed_length
+                chunk_idx += 1
+                continue
 
             # Here we need to read the actual chunk data from a bucket file
             data_fh = self.volume.hbk.zip.open(f"{self.volume.hbk.base}/Pool/{pool.p1}/{pool.p2}/{pool.pool}.bucket")
@@ -195,20 +255,18 @@ class FileStream(AlignedStream):
                     except Exception as e:
                         log.debug("Decryption with version %d keys failed: %s", version, e)
                         continue
-
             else:
                 uncompressed = lz4.decompress(data, uncompressed_size=data_info.uncompressed_length)
-            offset_in_block = offset % data_info.uncompressed_length
 
-            read_size = min(length, data_info.uncompressed_length - offset_in_block)
-            log.debug("Reading from chunk %d: offset_in_block=%d, read_size=%d", chunk_idx, offset_in_block, read_size)
+            # Calculate correct offset within this chunk
+            offset_in_block = current_offset - cumulative_offset if i == chunk_idx else 0
+
+            read_size = min(remaining_length, data_info.uncompressed_length - offset_in_block)
+            log.debug("Reading from chunk %d: offset_in_block=%d, read_size=%d", i, offset_in_block, read_size)
             result.append(uncompressed[offset_in_block : offset_in_block + read_size])
 
-            length -= read_size
-            offset += read_size
-            chunk_idx += 1
-            if read_size < data_info.uncompressed_length:
-                break
+            remaining_length -= read_size
+            cumulative_offset += data_info.uncompressed_length
 
         return b"".join(result)
 

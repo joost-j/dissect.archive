@@ -20,15 +20,21 @@ struct virtual_file_entry {
 };
 
 struct virtual_file_chunk_entry {
-    uint32          index;
-    uint32          offset;
+    uint32          unk_but_probably_some_sub_pool_id;
+    uint32          subindex_and_offset;
 }
 
 struct virtual_file_chunk_list {
+    uint16          unk0;
+    uint16          unk1;
+    uint32          unk2;
+    uint32          unk3;
+    uint16          unk4;
+    uint16          unk5;
     uint32          len;
     virtual_file_chunk_entry chunks[len - 8 >> 3];  // Divide by 8
-    uint32          unk1;
-    uint32          unk2;
+    uint32          unk6;
+    uint32          unk7;
 };
 
 struct chunk_pool_info {

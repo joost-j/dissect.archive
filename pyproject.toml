@@ -25,6 +25,7 @@ classifiers = [
   "Topic :: Utilities",
 ]
 dependencies = [
+    "pycryptodome",
     "pynacl",
     "argon2-cffi",
     "dissect.cstruct>=4,<5",

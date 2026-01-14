@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import BinaryIO
 
 import pytest
@@ -40,6 +41,7 @@ def test_hbk_crypted_no_keys_provided(hbk_encrypted: BinaryIO) -> None:
 
 def test_hbk_file_reading_1(hbk_unencrypted: BinaryIO) -> None:
     hbk = HBK(hbk_unencrypted)
+    hbk.use_version(3)
 
     assert hbk.get("/ssd/dissect_test/some_subfolder/").is_dir()
     file = hbk.get("/ssd/dissect_test/some_subfolder/large_repetitive_data.txt")
@@ -62,9 +64,9 @@ def test_hbk_file_reading_1(hbk_unencrypted: BinaryIO) -> None:
 
 def test_hbk_unencrypted_versioning(hbk_unencrypted: BinaryIO) -> None:
     hbk = HBK(hbk_unencrypted)
-    assert len(hbk.versions) == 3
+    assert len(hbk.versions) == 4
     # Automatically use highest version
-    assert hbk.current_version.id == 3
+    assert hbk.current_version.id == 4
     with pytest.raises(expected_exception=ValueError, match="Version 0 not found"):
         hbk.use_version(0)  # Error on non-existent version
 
@@ -76,3 +78,9 @@ def test_hbk_unencrypted_versioning(hbk_unencrypted: BinaryIO) -> None:
         hbk.get("/ssd/dissect_test/Password.txt").open().read()
         == b"My password is:\r\n\r\nWhoops, I shouldn't have put it there in plaintext."
     )
+
+
+def test_hbk_file_hashes(hbk_unencrypted: BinaryIO) -> None:
+    hbk = HBK(hbk_unencrypted)
+    file = hbk.get("/ssd/dissect_test/System32/System32/perfmon.exe")
+    assert hashlib.sha1(file.open().read()).hexdigest() == "ae644ffae259ebaf8df6a34d46af05436b8a70d1"

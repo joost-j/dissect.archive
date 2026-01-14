@@ -66,4 +66,4 @@ def hbk_encrypted() -> Iterator[BinaryIO]:
 
 @pytest.fixture
 def hbk_unencrypted() -> Iterator[BinaryIO]:
-    yield from open_file_gz("_data/dissect_backup_test_task.hbk.gz")
+    yield from open_file("_data/dissect_backup_test_task.hbk")
